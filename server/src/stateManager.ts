@@ -120,7 +120,17 @@ export class StateManager {
    * re-enter this pipeline as a later, separate broadcast.
    */
   async handleCommand(command: StampedCommand, author: EventAuthor, cause?: string): Promise<void> {
-    const run = this.queue.then(() => this.processCommand(command, author, cause));
+    return this.enqueue(() => this.processCommand(command, author, cause));
+  }
+
+  async handleCheckedCommands(build: (activities: readonly Activity[]) => Promise<StampedCommand[]>, author: EventAuthor): Promise<void> {
+    return this.enqueue(async () => {
+      for (const command of await build(this.activityState.list)) await this.processCommand(command, author);
+    });
+  }
+
+  private enqueue(work: () => Promise<void>): Promise<void> {
+    const run = this.queue.then(work);
     // Keep the queue alive even if this command throws, so later-queued
     // commands still run; the rejection itself still propagates to this caller.
     this.queue = run.catch(() => undefined);

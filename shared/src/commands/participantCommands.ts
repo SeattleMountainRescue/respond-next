@@ -25,7 +25,7 @@ export const ParticipantCommands = {
 
   UpdateParticipantMiles: defineCommand(
     'cmd/participant/miles',
-    (activityId: string, participantId: string, miles: number) => ({ payload: { activityId, participantId, miles } }),
+    (activityId: string, participantId: string, miles: number | null) => ({ payload: { activityId, participantId, miles } }),
     ParticipantEvents.ParticipantMilesUpdated,
   ),
 

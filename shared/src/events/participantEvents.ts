@@ -136,12 +136,13 @@ export const ParticipantEvents = {
   ParticipantMilesUpdated: defineEvent(
     //
     'evt/participant/milesUpdated',
-    (state: Draft<ActivityState>, { activityId, participantId, miles }: { activityId: string; participantId: string; miles: number }) => {
+    (state: Draft<ActivityState>, { activityId, participantId, miles }: { activityId: string; participantId: string; miles: number | null }) => {
       const activity = state.list.find((f) => f.id === activityId);
       if (!activity) return;
       const person = activity.participants[participantId];
       if (!person) return;
-      person.miles = miles;
+      if (miles === null) delete person.miles;
+      else person.miles = miles;
     },
   ),
 
@@ -153,8 +154,8 @@ export const ParticipantEvents = {
       if (!activity) return;
       const person = activity.participants[participantId];
       if (!person) return;
-      // null clears the ETA — normalize to undefined so Participant.eta stays number | undefined.
-      person.eta = eta ?? undefined;
+      if (eta === null) delete person.eta;
+      else person.eta = eta;
     },
   ),
 
