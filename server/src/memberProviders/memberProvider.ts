@@ -8,6 +8,7 @@ export interface MemberProvider {
   getMemberInfoById(memberId: string): Promise<MemberInfo | undefined>;
   getMemberPhoto(memberId: string): Promise<ArrayBuffer | undefined>;
   getParticipantInfo(query: string): Promise<MemberInfo | undefined>;
+  getOrganizationMember?(organizationId: string, memberId: string): Promise<MemberInfo | undefined>;
   searchMembers(organizationId: string, query: string): Promise<Array<MemberInfo>>;
   refresh(force?: boolean): Promise<{ ok: boolean; runtime: number; cached?: boolean }>;
 }

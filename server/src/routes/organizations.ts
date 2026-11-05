@@ -1,6 +1,9 @@
 import { Hono } from 'hono';
 
+import type { MemberInfo } from '@shared/types/member';
+
 import { getAuthFromContext, userFromAuth } from '../auth';
+import { authorizeApiRead, integrationError, requireOwnOrganization } from '../integrationAuth';
 import { getOrganizationById } from '../mongodb';
 import { getServices } from '../services';
 
@@ -18,7 +21,8 @@ organizationsRoutes.get('/v1/organizations', async (c) => {
 });
 
 organizationsRoutes.get('/v1/organizations/:orgId/members', async (c) => {
-  if (!userFromAuth(await getAuthFromContext(c))) return c.json({ error: 'Unauthorized' }, 401);
+  const integration = await authorizeApiRead(c, 'members:read');
+  if (integration) requireOwnOrganization(integration, c.req.param('orgId'));
   try {
     const organizationDoc = await getOrganizationById(c.req.param('orgId'));
     if (!organizationDoc) return c.json({ error: 'Organization not found' }, 404);
@@ -36,7 +40,7 @@ organizationsRoutes.get('/v1/organizations/:orgId/members', async (c) => {
 
     const list = await memberProvider.searchMembers(organizationDoc.id, query);
     if (!list) return c.json({ error: 'No results found' }, 404);
-    return c.json({ data: list });
+    return c.json({ data: integration ? list.map(({ id, name, given_name, family_name }) => ({ id, name, given_name, family_name })) : list });
   } catch (error) {
     console.error('Error searching members:', error);
     return c.json({ error: 'Failed to search members' }, 500);
@@ -44,16 +48,24 @@ organizationsRoutes.get('/v1/organizations/:orgId/members', async (c) => {
 });
 
 organizationsRoutes.get('/v1/organizations/:orgId/members/:memberId', async (c) => {
-  if (!userFromAuth(await getAuthFromContext(c))) return c.json({ status: 'not authenticated' }, 401);
+  const integration = await authorizeApiRead(c, 'members:read');
+  if (integration) requireOwnOrganization(integration, c.req.param('orgId'));
   const organizationDoc = await getOrganizationById(c.req.param('orgId'));
   if (!organizationDoc) return c.json({ status: 'unknown organization' }, 500);
 
   const memberProvider = (await getServices()).memberProviders.get(organizationDoc.memberProvider.provider);
   if (!memberProvider) return c.json({ status: 'unknown member provider' }, 500);
 
-  const memberInfo = await memberProvider.getParticipantInfo(c.req.param('memberId'));
+  let memberInfo: MemberInfo | undefined;
+  if (integration) {
+    if (!memberProvider.getOrganizationMember) throw integrationError(503, 'provider_unavailable', 'This member provider does not support organization-scoped lookup.');
+    memberInfo = await memberProvider.getOrganizationMember(organizationDoc.id, c.req.param('memberId'));
+  } else {
+    memberInfo = await memberProvider.getParticipantInfo(c.req.param('memberId'));
+  }
   if (!memberInfo) return c.json({ status: 'not found' }, 404);
-  return c.json({ data: memberInfo, status: 200 });
+  const { id, name, given_name, family_name } = memberInfo;
+  return c.json({ data: integration ? { id, name, given_name, family_name } : memberInfo, status: 200 });
 });
 
 organizationsRoutes.get('/v1/organizations/:orgId/members/:memberId/photo', async (c) => {

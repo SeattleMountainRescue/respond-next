@@ -59,7 +59,7 @@ interface Chunked<T> {
   results: T[];
 }
 
-function buildMemberInfo(member: D4HMemberResponse, groups: string[] = []): MemberInfo {
+function buildMemberInfo(member: Pick<D4HMemberResponse, 'id' | 'ref' | 'name' | 'email' | 'mobile'>, groups: string[] = []): MemberInfo {
   const [family_name, given_name] = member.name.split(', ');
   return {
     id: member.id.toString(),
@@ -176,6 +176,23 @@ export default class D4HMembersProvider implements MemberProvider {
 
     console.log(results);
     return results;
+  }
+
+  async getOrganizationMember(organizationId: string, memberId: string): Promise<MemberInfo | undefined> {
+    if (process.env.DEV_NETWORK_DISABLED) throw new Error('D4H network access is disabled');
+    const organization = await (await mongoPromise).db().collection<OrganizationDoc>(ORGS_COLLECTION).findOne({ id: organizationId });
+    if (!organization?.memberProvider.token) throw new Error('Member provider is not configured for this organization');
+    const [teamId, token] = organization.memberProvider.token.split(':');
+    const response = await fetch(`https://api.team-manager.us.d4h.com/v3/team/${teamId}/members/${encodeURIComponent(memberId)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (response.status === 404) return undefined;
+    if (!response.ok) throw new Error(`D4H member lookup failed: HTTP ${response.status}`);
+    const member: unknown = await response.json();
+    if (!member || typeof member !== 'object' || !('id' in member) || typeof member.id !== 'number' || String(member.id) !== memberId || !('name' in member) || typeof member.name !== 'string') {
+      throw new Error('D4H member lookup returned an invalid identity');
+    }
+    return buildMemberInfo({ id: member.id, name: member.name });
   }
 
   private async initialize() {
