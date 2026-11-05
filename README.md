@@ -132,6 +132,11 @@ GOOGLE_ID=<client-id>.apps.googleusercontent.com
 
 ## Architecture
 
+The optional server-to-server [integration API](docs/integration-api.md) uses
+organization-scoped API keys on the existing HTTP routes. It is disabled unless
+an administrator configures credentials; browser and socket authentication remain
+unchanged.
+
 The app is an npm-workspaces monorepo with three packages:
 - **`shared/`** (`@respond/shared`) — domain types + the isomorphic state (actions/reducers) used by both client and server.
 - **`server/`** (`@respond/server`) — a [Hono](https://hono.dev) Node server that owns the REST API, Google auth/session (iron-session), and the socket.io realtime server + in-memory `StateManager`. In **dev** it listens on **5173** (Vite proxies to it); in **production** it listens on **3000** and also serves the built client.
