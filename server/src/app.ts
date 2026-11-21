@@ -29,6 +29,7 @@ import type { LocationCatalog } from './locations';
 import type { MemberProviders } from './memberProviders';
 import type { GoogleSignIn, SignInStart } from './google';
 import { hasMaskable, iconSizeOf, iconSourceFor, IconRenderer } from './icons';
+import { integrationRoutes, type integrationKeys } from './integration';
 import { hostnameOf, type OrganizationStore } from './organizations';
 import { SESSION_COOKIE, SESSION_TTL_SECONDS, type SessionData, type SessionStore } from './sessions';
 import { devSignIn, memberSignIn, refreshSession, tierOn, type People } from './signIn';
@@ -61,6 +62,7 @@ export interface SyncAppOptions {
   locations?: LocationCatalog;
   /** The ops dashboard's forecasts. */
   weather?: WeatherSource;
+  integrationKeys?: ReturnType<typeof integrationKeys>;
   /** Dev-only JSON view of an activity's server state. Leave unset in production. */
   debugActivity?(activityId: string, view: string): Promise<unknown>;
 }
@@ -107,6 +109,8 @@ export function createSyncApp(hub: Hub, options: SyncAppOptions) {
     c.set('site', site);
     await next();
   });
+
+  app.route('/api/integration/v1', integrationRoutes(hub, options.integrationKeys ?? new Map(), options.members));
 
   /**
    * The signed-in session, if it was started on this site. With the dev sign-in it may also come from

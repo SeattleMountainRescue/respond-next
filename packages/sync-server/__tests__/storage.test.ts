@@ -105,6 +105,22 @@ describe.each(backends)('%s storage', (_name, makeBackend) => {
     expect(await storage.load('nope')).toBeUndefined();
   });
 
+  it('replays a committed integration write from storage after the actor is replaced', async () => {
+    const makeHub = () => new Hub({ storage, registry: testRegistry, projector: testProjector, now: () => 1000 });
+    const viewer = { userId: 'integration:fixture', tier: 'manage' };
+    const hub = makeHub();
+    await hub.pushAsSystem('e1', viewer, [{ name: 'addPerson', args: { id: 'initial', name: 'Initial' } }]);
+    const request = {
+      viewer, expectedVersion: 1, requestId: 'stable-request', fingerprint: 'original',
+      prepare: () => ({ name: 'addPerson', args: { id: 'new', name: 'New' } }),
+    };
+    expect(await hub.submitIntegration('e1', request)).toEqual({ version: 2 });
+    const restarted = makeHub();
+    expect(await restarted.submitIntegration('e1', request)).toEqual({ version: 2 });
+    expect(await restarted.submitIntegration('e1', { ...request, fingerprint: 'different' })).toMatchObject({ reason: 'idempotency_conflict' });
+    expect((await restarted.read('e1', viewer)).version).toBe(2);
+  });
+
   it('round-trips records, tombstones and the highest mutation id per client', async () => {
     await storage.commit('e1', {
       fromVersion: 0,

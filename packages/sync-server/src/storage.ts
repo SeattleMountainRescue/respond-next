@@ -15,6 +15,7 @@ export interface LogEntry {
   receivedAt: number;
   outcome: 'applied' | 'rejected';
   reason?: string;
+  requestFingerprint?: string;
   effects: { type: string; id: string; before?: Rec; after?: Rec }[];
 }
 
@@ -57,6 +58,7 @@ export interface ActivityStorage {
   commit(activityId: string, batch: CommitBatch): Promise<void>;
   /** The latest log entries for an activity, oldest first; for debugging tools. */
   recentLog(activityId: string, limit: number): Promise<LogEntry[]>;
+  integrationReceipt(activityId: string, clientId: string): Promise<LogEntry | undefined>;
   /** Every stored activity's id, e.g. to rebuild summaries. */
   activityIds(): Promise<string[]>;
 }
@@ -87,6 +89,10 @@ export class MemoryStorage implements ActivityStorage {
 
   async recentLog(activityId: string, limit: number): Promise<LogEntry[]> {
     return this.log.filter((e) => e.activityId === activityId).slice(-limit);
+  }
+
+  async integrationReceipt(activityId: string, clientId: string): Promise<LogEntry | undefined> {
+    return this.log.find((e) => e.activityId === activityId && e.clientId === clientId && e.mutationId === 1);
   }
 
   async activityIds(): Promise<string[]> {

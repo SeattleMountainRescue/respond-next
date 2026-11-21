@@ -1,5 +1,5 @@
 import { ACCESS_CHANGED, ClientMessage, decode, encode, randomId, type ServerMessage, type Viewer } from '@sync/core';
-import { ActivityActor, ActorUnloadedError, type ActivityRead, type ActorConn, type ActorDeps } from './activityActor';
+import { ActivityActor, ActorUnloadedError, INTEGRATION_CLIENT_PREFIX, type ActivityRead, type ActorConn, type ActorDeps, type IntegrationChange, type IntegrationResult } from './activityActor';
 import { StorageConflictError } from './storage';
 
 /** The transport side of one client connection (a WebSocket in production, a fake in tests). */
@@ -87,6 +87,11 @@ export class Hub {
     return this.withActor(activityId, (a) => a.read(viewer));
   }
 
+  submitIntegration(activityId: string, change: IntegrationChange): Promise<IntegrationResult> {
+    if (activityId.startsWith('$') || this.deps.readOnly?.(activityId)) return Promise.resolve({ reason: 'not_found', message: "That activity isn't here" });
+    return this.withActor(activityId, (actor) => actor.submitIntegration(change));
+  }
+
   /**
    * Unloads activities no one has been subscribed to, and that have done nothing, for `idleMs`; the
    * next thing to need one loads it again. Returns how many it unloaded. Call it now and then.
@@ -148,6 +153,10 @@ export class Hub {
   private async handle(conn: Conn, msg: ClientMessage): Promise<void> {
     if (conn.closed) return;
     if (msg.t === 'hello') {
+      if (msg.clientId.startsWith(INTEGRATION_CLIENT_PREFIX)) {
+        this.send(conn, { t: 'error', code: 'bad_client_id', message: 'That client id is reserved' });
+        return;
+      }
       conn.actorConn = {
         id: conn.id,
         clientId: msg.clientId,

@@ -19,6 +19,7 @@ import { StorageConflictError, type ActivityStorage, type LogEntry } from './sto
 
 /** The client id the server's own changes are logged under. */
 const SYSTEM_CLIENT = 'system';
+export const INTEGRATION_CLIENT_PREFIX = 'integration:';
 
 /** How far in the future a mutation's `at` may be, to absorb client clock error. */
 const MAX_FUTURE_AT_MS = 2 * 60_000;
@@ -71,6 +72,16 @@ export interface ActivityRead {
   view: string;
   records: Rec[];
 }
+
+export interface IntegrationChange {
+  viewer: Viewer;
+  requestId: string;
+  fingerprint: string;
+  expectedVersion: number;
+  prepare(view: ReadView, now: number): { name: string; args: unknown };
+}
+
+export type IntegrationResult = { version: number } | { reason: string; message: string };
 
 type Applied = { writes: Map<string, Rec> } | { reason: string; message: string };
 
@@ -169,6 +180,44 @@ export class ActivityActor {
     });
   }
 
+  submitIntegration(change: IntegrationChange): Promise<IntegrationResult> {
+    return this.serial(async () => {
+      const { viewer, requestId, fingerprint, expectedVersion } = change;
+      const effective = this.deps.projector.viewerIn?.(viewer, this.view, this.activityId) ?? viewer;
+      if (!this.version || this.deps.projector.viewKey(effective) === HIDDEN_VIEW) return { reason: 'not_found', message: "That activity isn't here" };
+      if (this.stale) return { reason: 'stale_version', message: 'Read the activity before retrying' };
+      const clientId = INTEGRATION_CLIENT_PREFIX + requestId;
+      const receipt = await this.deps.storage.integrationReceipt(this.activityId, clientId);
+      if (receipt) {
+        return receipt.requestFingerprint !== fingerprint
+          ? { reason: 'idempotency_conflict', message: 'That request key was used with different input' }
+          : { version: receipt.version };
+      }
+      if (this.version !== expectedVersion) return { reason: 'stale_version', message: 'Read the activity before retrying' };
+      const now = this.deps.now();
+      let prepared: ReturnType<IntegrationChange['prepare']>;
+      try {
+        prepared = change.prepare(this.view, now);
+      } catch (err) {
+        if (!(err instanceof Rejection)) throw err;
+        return { reason: err.code, message: err.message };
+      }
+      let rejected: IntegrationResult | undefined;
+      const conn: ActorConn = {
+        id: clientId, clientId, viewer,
+        send: (msg) => { if (msg.t === 'reject') rejected = { reason: msg.reason, message: msg.message }; },
+        close: () => { rejected = { reason: 'stale_version', message: 'Read the activity before retrying' }; },
+      };
+      try {
+        await this.doPush(conn, [{ id: 1, name: prepared.name, v: this.deps.registry.latest(prepared.name)?.version ?? 1, args: prepared.args, clientTime: now }], true, fingerprint);
+      } catch (err) {
+        if (!(err instanceof StorageConflictError)) throw err;
+        return { reason: 'stale_version', message: 'Read the activity before retrying' };
+      }
+      return rejected ?? { version: this.version };
+    });
+  }
+
   /** Every visible record as a view sees it; for catch-up, tests and the dev dashboard. */
   projectedRecords(viewKey: string): Rec[] {
     const out: Rec[] = [];
@@ -224,7 +273,7 @@ export class ActivityActor {
     this.subs.set(conn.id, { conn, viewKey, sentVersion: this.version, sentMutationId: lastMutationId });
   }
 
-  private async doPush(conn: ActorConn, mutations: WireMutation[], system = false): Promise<void> {
+  private async doPush(conn: ActorConn, mutations: WireMutation[], system = false, requestFingerprint?: string): Promise<void> {
     if (this.stale) return conn.close(1012, 'activity reloaded');
     if (!system && !this.subs.has(conn.id)) {
       conn.send({ t: 'error', code: 'not_subscribed', message: `Subscribe to ${this.activityId} before pushing` });
@@ -253,6 +302,10 @@ export class ActivityActor {
       };
       const result = this.applyOne(batch, conn, m, receivedAt);
       if ('reason' in result) {
+        if (requestFingerprint !== undefined) {
+          conn.send({ t: 'reject', activityId: this.activityId, mutationId: m.id, reason: result.reason, message: result.message });
+          return;
+        }
         log.push({ ...entry, version, outcome: 'rejected', reason: result.reason, effects: [] });
         rejects.push({ t: 'reject', activityId: this.activityId, mutationId: m.id, reason: result.reason, message: result.message });
         continue;
@@ -265,7 +318,7 @@ export class ActivityActor {
         batch.writes.set(key, stamped);
       }
       const at = (m.args as { at?: unknown } | null)?.at;
-      log.push({ ...entry, version, at: typeof at === 'number' ? at : undefined, outcome: 'applied', effects });
+      log.push({ ...entry, version, at: typeof at === 'number' ? at : undefined, outcome: 'applied', effects, ...(requestFingerprint === undefined ? {} : { requestFingerprint }) });
     }
     if (log.length === 0) return;
     // An activity that doesn't exist (nothing has applied to it) stays that way until a change does
@@ -278,7 +331,7 @@ export class ActivityActor {
 
     const changed = [...batch.writes.values()];
     try {
-      await this.deps.storage.commit(this.activityId, { fromVersion: this.version, version, records: changed, lastMutationIds: { [conn.clientId]: lastId }, log });
+      await this.deps.storage.commit(this.activityId, { fromVersion: this.version, version, records: changed, lastMutationIds: requestFingerprint === undefined ? { [conn.clientId]: lastId } : {}, log });
     } catch (err) {
       if (err instanceof StorageConflictError) this.retire();
       throw err;
@@ -286,7 +339,7 @@ export class ActivityActor {
 
     for (const r of changed) this.records.set(recKey(r), r);
     this.version = version;
-    this.lastMutationIds.set(conn.clientId, lastId);
+    if (requestFingerprint === undefined) this.lastMutationIds.set(conn.clientId, lastId);
     for (const r of rejects) conn.send(r);
     this.fanOut(changed);
     if (changed.length) this.deps.onCommit?.(this.activityId, this.view, log.filter((e) => e.outcome === 'applied').map((entry) => ({ entry, viewer: conn.viewer })));

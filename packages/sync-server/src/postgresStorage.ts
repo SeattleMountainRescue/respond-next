@@ -154,6 +154,11 @@ export class PostgresStorage implements ActivityStorage {
     return res.rows.map((r) => r.entry).reverse();
   }
 
+  async integrationReceipt(activityId: string, clientId: string): Promise<LogEntry | undefined> {
+    const res = await this.pool.query<{ entry: LogEntry }>('SELECT entry FROM mutation_log WHERE activity_id = $1 AND client_id = $2 AND mutation_id = 1', [activityId, clientId]);
+    return res.rows[0]?.entry;
+  }
+
   async activityIds(): Promise<string[]> {
     const res = await this.pool.query<{ activity_id: string }>('SELECT activity_id FROM activity_meta');
     return res.rows.map((r) => r.activity_id);

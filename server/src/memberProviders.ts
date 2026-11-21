@@ -52,6 +52,14 @@ export class MemberProviders {
     return source ? this.details(source, await this.directory(source)?.lookup(personRef), unitId) : undefined;
   }
 
+  async lookupInOrganization(orgId: string, personRef: string): Promise<MemberInfo | undefined> {
+    const org = this.orgs.get(orgId);
+    const source = splitPersonRef(personRef)?.source;
+    if (!org || !source || source !== this.orgs.providerOf(orgId)) return undefined;
+    const found = await this.directory(source)?.lookup(personRef);
+    return found && (!org.providerUnit || found.units.includes(org.providerUnit)) ? found.member : undefined;
+  }
+
   /**
    * Who is signing in with this email: asked of the provider for the email's domain, found up the
    * tree from the organization that domain belongs to, or else of the site's own provider.

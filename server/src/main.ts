@@ -14,6 +14,7 @@ import { MemoryGrantStore, PostgresGrantStore, type GrantStore } from './grants'
 import { MemberInfoWriter } from './memberInfo';
 import { MemberProviders } from './memberProviders';
 import { SignInProviders } from './google';
+import { integrationKeys } from './integration';
 import { OrganizationStore } from './organizations';
 import { SecretBox } from './secrets';
 import { MemorySessionStore, PostgresSessionStore, type SessionStore } from './sessions';
@@ -29,6 +30,8 @@ const production = process.env.NODE_ENV === 'production';
 // local build that reaches the internet doesn't take them along.
 const devTools = process.env.DEV_TOOLS === 'true';
 if (devTools) console.warn('DEV_TOOLS is on: anyone can sign in as anyone. Never on an internet-facing site.');
+const keys = integrationKeys(process.env.INTEGRATION_API_KEYS);
+if (keys.size && !process.env.DATABASE_URL) throw new Error('The integration API requires DATABASE_URL for durable storage');
 
 // SITE_ADMINS: comma-separated emails, site admins beside those the admin page keeps.
 const envAdmins = (process.env.SITE_ADMINS ?? '').split(',');
@@ -128,6 +131,7 @@ setInterval(() => void summaries.prune().catch((err) => console.error('sync: pru
 const { app, injectWebSocket } = createSyncApp(hub, {
   organizations,
   sessions,
+  integrationKeys: keys,
   devSignIn: devTools,
   // Each site signs in through its organization's sign-in provider (or its nearest ancestor's).
   signIn: new SignInProviders(organizations),
