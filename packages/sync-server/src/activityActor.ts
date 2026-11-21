@@ -77,8 +77,9 @@ export interface IntegrationChange {
   viewer: Viewer;
   requestId: string;
   fingerprint: string;
-  expectedVersion: number;
-  prepare(view: ReadView, now: number): { name: string; args: unknown };
+  expectedVersion?: number;
+  create?: boolean;
+  prepare(view: ReadView, now: number): { name: string; args: unknown } | { name: string; args: unknown }[];
 }
 
 export type IntegrationResult = { version: number } | { reason: string; message: string };
@@ -184,16 +185,18 @@ export class ActivityActor {
     return this.serial(async () => {
       const { viewer, requestId, fingerprint, expectedVersion } = change;
       const effective = this.deps.projector.viewerIn?.(viewer, this.view, this.activityId) ?? viewer;
-      if (!this.version || this.deps.projector.viewKey(effective) === HIDDEN_VIEW) return { reason: 'not_found', message: "That activity isn't here" };
-      if (this.stale) return { reason: 'stale_version', message: 'Read the activity before retrying' };
+      if ((!this.version && !change.create) || this.deps.projector.viewKey(effective) === HIDDEN_VIEW) return { reason: 'not_found', message: "That activity isn't here" };
       const clientId = INTEGRATION_CLIENT_PREFIX + requestId;
-      const receipt = await this.deps.storage.integrationReceipt(this.activityId, clientId);
-      if (receipt) {
+      const replay = async (): Promise<IntegrationResult | undefined> => {
+        const receipt = await this.deps.storage.integrationReceipt(this.activityId, clientId);
+        if (!receipt) return undefined;
         return receipt.requestFingerprint !== fingerprint
           ? { reason: 'idempotency_conflict', message: 'That request key was used with different input' }
           : { version: receipt.version };
-      }
-      if (this.version !== expectedVersion) return { reason: 'stale_version', message: 'Read the activity before retrying' };
+      };
+      const committed = await replay();
+      if (committed) return committed;
+      if (this.stale || (expectedVersion !== undefined && this.version !== expectedVersion)) return { reason: 'stale_version', message: 'Read the activity before retrying' };
       const now = this.deps.now();
       let prepared: ReturnType<IntegrationChange['prepare']>;
       try {
@@ -209,10 +212,13 @@ export class ActivityActor {
         close: () => { rejected = { reason: 'stale_version', message: 'Read the activity before retrying' }; },
       };
       try {
-        await this.doPush(conn, [{ id: 1, name: prepared.name, v: this.deps.registry.latest(prepared.name)?.version ?? 1, args: prepared.args, clientTime: now }], true, fingerprint);
+        const operations = Array.isArray(prepared) ? prepared : [prepared];
+        await this.doPush(conn, operations.map(({ name, args }, index) => ({
+          id: index + 1, name, args, v: this.deps.registry.latest(name)?.version ?? 1, clientTime: now,
+        })), true, fingerprint);
       } catch (err) {
         if (!(err instanceof StorageConflictError)) throw err;
-        return { reason: 'stale_version', message: 'Read the activity before retrying' };
+        return (await replay()) ?? { reason: 'stale_version', message: 'Read the activity before retrying' };
       }
       return rejected ?? { version: this.version };
     });
@@ -310,7 +316,7 @@ export class ActivityActor {
         rejects.push({ t: 'reject', activityId: this.activityId, mutationId: m.id, reason: result.reason, message: result.message });
         continue;
       }
-      version += 1;
+      if (requestFingerprint === undefined || version === this.version) version += 1;
       const effects: LogEntry['effects'] = [];
       for (const [key, r] of result.writes) {
         const stamped = { ...r, version };

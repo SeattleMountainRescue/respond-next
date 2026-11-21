@@ -2,7 +2,7 @@ import { Alert, Box, Button, List, ListItemButton, ListItemText, Paper, Stack, T
 import { useCallback, useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { AdminOrganizationsResponse, MemberProviderConfig, MemberProviderView, Organization, SignInProviderConfig, SignInProviderView, SiteAdminsResponse } from '@sync/domain';
-import { useApi } from '../../shell/api';
+import { useApi, type IntegrationKeyView } from '../../shell/api';
 import { useDialogs } from '../../shell/dialogs';
 import { ToolbarPage } from '../../shell/ToolbarPage';
 import { parseList } from './adminFields';
@@ -117,11 +117,82 @@ export function OrganizationAdmin() {
             </List>
           )}
         </Paper>
+        {selected && selected !== 'new' && <IntegrationKeys key={selected.id} organizationId={selected.id} />}
         {data.siteAdmin && <MemberProviders onChange={load} />}
         {data.siteAdmin && <SignInProviders onChange={load} />}
         {data.siteAdmin && <SiteAdmins />}
       </Stack>
     </ToolbarPage>
+  );
+}
+
+function IntegrationKeys({ organizationId }: { organizationId: string }) {
+  const api = useApi();
+  const { confirm } = useDialogs();
+  const [keys, setKeys] = useState<IntegrationKeyView[]>();
+  const [name, setName] = useState('');
+  const [personRef, setPersonRef] = useState('');
+  const [webhookTarget, setWebhookTarget] = useState('');
+  const [token, setToken] = useState('');
+  const [signingSecret, setSigningSecret] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const load = useCallback(async () => {
+    try {
+      setKeys(await api.admin.integrationKeys(organizationId));
+    } catch (err) {
+      setError(message(err));
+    }
+  }, [api, organizationId]);
+  useEffect(() => { void load(); }, [load]);
+  const act = async (action: () => Promise<void>) => {
+    setError('');
+    setBusy(true);
+    try {
+      await action();
+      await load();
+    } catch (err) {
+      setError(message(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const issue = () => act(async () => {
+    const created = await api.admin.issueIntegrationKey(organizationId, { name, personRef, webhookTarget: webhookTarget.trim() || undefined });
+    setToken(created.token);
+    setSigningSecret(created.signingSecret ?? '');
+    setName('');
+    setPersonRef('');
+    setWebhookTarget('');
+  });
+  const revoke = async (key: IntegrationKeyView) => {
+    if (!(await confirm({ prompt: `Revoke the integration key ${key.name}?`, destructive: true, label: 'Revoke' }))) return;
+    await act(() => api.admin.revokeIntegrationKey(organizationId, key.id));
+  };
+  return (
+    <Paper sx={{ p: 2 }}>
+      <Stack spacing={2}>
+        <Typography variant="h5">Integration keys</Typography>
+        {error && <Alert severity="error">{error}</Alert>}
+        {keys && <>
+          {keys.map((key) => <Stack direction="row" sx={{ justifyContent: 'space-between' }} key={key.id}>
+            <ListItemText primary={key.name} secondary={`${key.personRef} · ${key.revokedAt ? 'Revoked' : key.lastUsedAt ? `Last used ${new Date(key.lastUsedAt).toLocaleString()}` : 'Never used'}`} />
+            {!key.revokedAt && <Button disabled={busy} onClick={() => void revoke(key)}>Revoke</Button>}
+          </Stack>)}
+          {token ? <>
+            <Alert severity="info">Copy this key now. Respond won’t show it again.</Alert>
+            <TextField label="New integration key" value={token} slotProps={{ input: { readOnly: true } }} />
+            {signingSecret && <TextField label="Webhook signing secret" value={signingSecret} slotProps={{ input: { readOnly: true } }} />}
+            <Button onClick={() => { setToken(''); setSigningSecret(''); }}>Hide secrets</Button>
+          </> : <Stack direction="row" spacing={2}>
+            <TextField label="Key name" value={name} onChange={(e) => setName(e.target.value)} />
+            <TextField label="Directory person reference" value={personRef} onChange={(e) => setPersonRef(e.target.value)} />
+            <TextField label="Approved webhook target (optional)" value={webhookTarget} onChange={(e) => setWebhookTarget(e.target.value)} />
+            <Button disabled={busy || !name.trim() || !personRef.trim()} onClick={() => void issue()}>Issue key</Button>
+          </Stack>}
+        </>}
+      </Stack>
+    </Paper>
   );
 }
 

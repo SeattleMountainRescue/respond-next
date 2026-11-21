@@ -29,7 +29,9 @@ import type { LocationCatalog } from './locations';
 import type { MemberProviders } from './memberProviders';
 import type { GoogleSignIn, SignInStart } from './google';
 import { hasMaskable, iconSizeOf, iconSourceFor, IconRenderer } from './icons';
-import { integrationRoutes, type integrationKeys } from './integration';
+import { integrationRoutes, newIntegrationCredential, NewIntegrationKey, type integrationKeys } from './integration';
+import { bodyLimit } from 'hono/body-limit';
+import type { webhookTargets } from './integrationWebhooks';
 import { hostnameOf, type OrganizationStore } from './organizations';
 import { SESSION_COOKIE, SESSION_TTL_SECONDS, type SessionData, type SessionStore } from './sessions';
 import { devSignIn, memberSignIn, refreshSession, tierOn, type People } from './signIn';
@@ -63,6 +65,7 @@ export interface SyncAppOptions {
   /** The ops dashboard's forecasts. */
   weather?: WeatherSource;
   integrationKeys?: ReturnType<typeof integrationKeys>;
+  webhookTargets?: ReturnType<typeof webhookTargets>;
   /** Dev-only JSON view of an activity's server state. Leave unset in production. */
   debugActivity?(activityId: string, view: string): Promise<unknown>;
 }
@@ -110,7 +113,7 @@ export function createSyncApp(hub: Hub, options: SyncAppOptions) {
     await next();
   });
 
-  app.route('/api/integration/v1', integrationRoutes(hub, options.integrationKeys ?? new Map(), options.members));
+  app.route('/api/integration/v1', integrationRoutes(hub, options.integrationKeys ?? new Map(), orgs, options.members, options.grants));
 
   /**
    * The signed-in session, if it was started on this site. With the dev sign-in it may also come from
@@ -382,6 +385,42 @@ export function createSyncApp(hub: Hub, options: SyncAppOptions) {
   }
 
   // Organization admin: site admins see everything; an organization's admins, it and those under it.
+  const integrationAdminPath = '/api/admin/organizations/:id/integration-keys';
+  const keyAdmin = async (c: Context<Env>, next: () => Promise<void>) => {
+    c.header('Cache-Control', 'no-store');
+    if (!orgs.managesIntegrationKeys) return c.json({ error: 'Integration key management requires PostgreSQL' }, 404);
+    const orgId = c.req.param('id');
+    if (!orgId || !orgs.get(orgId)) return c.json({ error: 'No such organization' }, 404);
+    if (!orgs.canEdit(c.get('session').email, orgId)) return c.json({ error: 'Not an admin for this organization' }, 403);
+    await next();
+  };
+  app.get(integrationAdminPath, signedIn, keyAdmin, async (c) => {
+    return c.json({ keys: await orgs.listIntegrationKeys(c.req.param('id')!) });
+  });
+  app.post(integrationAdminPath, signedIn, keyAdmin, bodyLimit({ maxSize: 2048 }), async (c) => {
+    if (c.req.header('content-type')?.split(';', 1)[0]?.trim().toLowerCase() !== 'application/json') return c.json({ error: 'Expected JSON' }, 415);
+    const input = NewIntegrationKey.safeParse(await c.req.json().catch((err: unknown) => {
+      if (!(err instanceof SyntaxError)) throw err;
+      return undefined;
+    }));
+    if (!input.success) return c.json({ error: 'Provide a key name and a directory person reference' }, 400);
+    const organizationId = c.req.param('id');
+    if (!(await options.members?.accessInOrganization(organizationId, input.data.personRef))) {
+      return c.json({ error: 'That member is not in this organization’s directory' }, 400);
+    }
+    const { name, personRef, webhookTarget } = input.data;
+    if (webhookTarget && (!orgs.canSignIntegrationWebhooks || options.webhookTargets?.get(webhookTarget)?.organizationId !== organizationId)) {
+      return c.json({ error: 'That webhook target is not available for this organization' }, 400);
+    }
+    const { id, token, sha256, signingSecret } = newIntegrationCredential();
+    await orgs.createIntegrationKey({ id, sha256, organizationId, name, personRef, createdBy: c.get('session').userId },
+      webhookTarget ? { targetId: webhookTarget, secret: signingSecret } : undefined);
+    return c.json({ id, token, ...(webhookTarget ? { signingSecret } : {}) }, 201);
+  });
+  app.delete(`${integrationAdminPath}/:keyId`, signedIn, keyAdmin, async (c) => {
+    if (!(await orgs.revokeIntegrationKey(c.req.param('keyId')!, c.req.param('id')!))) return c.json({ error: 'No active key' }, 404);
+    return c.json({ status: 'ok' });
+  });
   app.get('/api/admin/organizations', signedIn, (c) => {
     const { email } = c.get('session');
     const editable = orgs.editableBy(email);

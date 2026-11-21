@@ -34,6 +34,7 @@ describe('home', () => {
     expect(within(card(TITLE, 1)).getByText('CRT 1')).toBeTruthy();
     expect(within(card(TITLE, 1)).getByText('In Progress')).toBeTruthy();
 
+    await screen.findByText('Rope rescue refresher', { selector: 'h6' });
     const training = within(card('Rope rescue refresher'));
     expect(training.getByText('Not Started')).toBeTruthy();
     expect(training.getByText('Start Time')).toBeTruthy();

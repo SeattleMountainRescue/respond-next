@@ -5,6 +5,7 @@
  * secrets are stored encrypted (see secrets.ts).
  */
 import pg from 'pg';
+import { INTEGRATION_WEBHOOK_SCHEMA } from '@sync/server';
 import type { z } from 'zod';
 import {
   MemberProviderConfig,
@@ -40,6 +41,19 @@ CREATE TABLE IF NOT EXISTS sign_in_providers (
 CREATE TABLE IF NOT EXISTS site_admins (
   email text PRIMARY KEY
 );
+CREATE TABLE IF NOT EXISTS integration_keys (
+  id text PRIMARY KEY,
+  organization_id text NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  sha256 text NOT NULL,
+  person_ref text NOT NULL,
+  name text NOT NULL,
+  created_by text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  last_used_at timestamptz,
+  revoked_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS integration_keys_org ON integration_keys (organization_id);
+${INTEGRATION_WEBHOOK_SCHEMA}
 -- Kept the seed's history when the seed was applied at startup.
 DROP TABLE IF EXISTS seeded;`;
 
@@ -53,6 +67,18 @@ export interface StoreOptions {
   envAdmins?: string[];
   /** Encrypts providers' secrets. In memory, a key for the process is made if none is given. */
   secrets?: SecretBox;
+}
+
+interface WebhookJob {
+  keyId: string;
+  activityId: string;
+  version: string;
+  changedAt: string;
+  attempts: number;
+  targetId: string;
+  signingSecret: string;
+  organizationId: string;
+  personRef: string;
 }
 
 const UPSERT_ORGANIZATION = 'INSERT INTO organizations (id, data) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data';
@@ -130,6 +156,107 @@ export class OrganizationStore {
     store.storedAdmins = new Set(seed.siteAdmins);
     store.check();
     return store;
+  }
+
+  get managesIntegrationKeys(): boolean {
+    return this.pool !== undefined;
+  }
+
+  async integrationKey(id: string, organizationId: string) {
+    const result = await this.pool?.query<{ id: string; sha256: string; personRef: string; organizationId: string }>(
+      `SELECT id, sha256, person_ref AS "personRef", organization_id AS "organizationId"
+       FROM integration_keys WHERE id = $1 AND organization_id = $2 AND revoked_at IS NULL`, [id, organizationId],
+    );
+    return result?.rows[0];
+  }
+
+  async listIntegrationKeys(organizationId: string) {
+    const result = await this.pool?.query(
+      `SELECT id, name, person_ref AS "personRef", created_by AS "createdBy", created_at AS "createdAt",
+              last_used_at AS "lastUsedAt", revoked_at AS "revokedAt"
+       FROM integration_keys WHERE organization_id = $1 ORDER BY created_at DESC`, [organizationId],
+    );
+    return result?.rows;
+  }
+
+  get canSignIntegrationWebhooks(): boolean {
+    return this.managesIntegrationKeys && this.secrets.ready;
+  }
+
+  async createIntegrationKey(key: { id: string; organizationId: string; sha256: string; personRef: string; name: string; createdBy: string },
+    webhook?: { targetId: string; secret: string }) {
+    if (!this.pool) throw new Error('Integration key management requires PostgreSQL');
+    await this.transaction(async (db) => {
+      await db.query(
+        'INSERT INTO integration_keys (id, organization_id, sha256, person_ref, name, created_by) VALUES ($1, $2, $3, $4, $5, $6)',
+        [key.id, key.organizationId, key.sha256, key.personRef, key.name, key.createdBy],
+      );
+      if (webhook) await db.query(
+        'INSERT INTO integration_webhooks (key_id, target_id, signing_secret) VALUES ($1, $2, $3)',
+        [key.id, webhook.targetId, this.secrets.encrypt(webhook.secret)],
+      );
+    });
+  }
+
+  async markIntegrationKeyUsed(id: string, organizationId: string) {
+    await this.pool?.query(
+      `UPDATE integration_keys SET last_used_at = now()
+       WHERE id = $1 AND organization_id = $2 AND revoked_at IS NULL
+         AND (last_used_at IS NULL OR last_used_at < now() - interval '5 minutes')`, [id, organizationId],
+    );
+  }
+
+  async revokeIntegrationKey(id: string, organizationId: string) {
+    if (!this.pool) return false;
+    let revoked = false;
+    await this.transaction(async (db) => {
+      const result = await db.query(
+        'UPDATE integration_keys SET revoked_at = now() WHERE id = $1 AND organization_id = $2 AND revoked_at IS NULL',
+        [id, organizationId],
+      );
+      if (result.rowCount !== 1) return;
+      await db.query('DELETE FROM integration_webhooks WHERE key_id = $1', [id]);
+      revoked = true;
+    });
+    return revoked;
+  }
+
+  openWebhookSecret(sealed: string): string {
+    return this.secrets.decrypt(sealed);
+  }
+
+  async claimWebhookJobs(): Promise<WebhookJob[]> {
+    if (!this.pool) throw new Error('Integration webhooks require PostgreSQL');
+    const { rows } = await this.pool.query<WebhookJob>(`
+      WITH ready AS (
+        SELECT j.key_id, j.activity_id, j.version FROM integration_webhook_jobs j
+        WHERE j.ready_at <= now()
+        ORDER BY j.ready_at LIMIT 16 FOR UPDATE SKIP LOCKED
+      )
+      UPDATE integration_webhook_jobs j SET attempts = j.attempts + 1, ready_at = now() + interval '1 minute'
+      FROM ready r, integration_webhooks h, integration_keys k
+      WHERE (j.key_id, j.activity_id, j.version) = (r.key_id, r.activity_id, r.version)
+        AND j.ready_at <= now() AND h.key_id = j.key_id AND k.id = j.key_id AND k.revoked_at IS NULL
+      RETURNING j.key_id AS "keyId", j.activity_id AS "activityId", j.version, j.changed_at AS "changedAt", j.attempts,
+                h.target_id AS "targetId", h.signing_secret AS "signingSecret", k.organization_id AS "organizationId", k.person_ref AS "personRef"
+    `);
+    return rows;
+  }
+
+  async finishWebhookJob(job: WebhookJob) {
+    await this.pool?.query(
+      'DELETE FROM integration_webhook_jobs WHERE key_id = $1 AND activity_id = $2 AND version = $3 AND attempts = $4',
+      [job.keyId, job.activityId, job.version, job.attempts],
+    );
+  }
+
+  async retryWebhookJob(job: WebhookJob) {
+    const delay = Math.min(3600, 2 ** Math.min(job.attempts, 12));
+    await this.pool?.query(
+      `UPDATE integration_webhook_jobs SET ready_at = now() + ($5 * interval '1 second')
+       WHERE key_id = $1 AND activity_id = $2 AND version = $3 AND attempts = $4`,
+      [job.keyId, job.activityId, job.version, job.attempts, delay],
+    );
   }
 
   static async connect(url: string, options: StoreOptions = {}): Promise<OrganizationStore> {
@@ -448,7 +575,10 @@ export class OrganizationStore {
     next.delete(id);
     const problem = problems(next, this.providers.stored, this.signIns.stored)[0];
     if (problem) return { ok: false, status: 400, error: problem };
-    await this.pool?.query('DELETE FROM organizations WHERE id = $1', [id]);
+    await this.transaction(async (db) => {
+      await db.query('DELETE FROM integration_webhooks WHERE key_id IN (SELECT id FROM integration_keys WHERE organization_id = $1)', [id]);
+      await db.query('DELETE FROM organizations WHERE id = $1', [id]);
+    });
     this.orgs.delete(id);
     return { ok: true, saved: null };
   }

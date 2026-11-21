@@ -7,7 +7,7 @@
  */
 import { MapView, recKey, type ReadView, type Rec } from '@sync/core';
 import { ACTIVITY_ARCHIVE_ID, ACTIVITY_LIST_ID, SYSTEM_VIEWER, activitySummary, inActivityList, isReservedScope, type ActivitySummary } from '@sync/domain';
-import type { ActivityStorage, Hub } from '@sync/server';
+import type { ActivityStorage, CommittedChange, Hub } from '@sync/server';
 
 export interface SummaryOptions {
   debounceMs?: number;
@@ -48,14 +48,15 @@ export class SummaryWriter {
   }
 
   /** Pass as the hub's `onCommit`. */
-  readonly onCommit = (activityId: string, view: ReadView): void => {
+  readonly onCommit = (activityId: string, view: ReadView, changes: CommittedChange[] = []): void => {
     if (isReservedScope(activityId)) return;
     const now = Date.now();
     const pending = this.pending.get(activityId);
     if (pending) clearTimeout(pending.timer);
     const since = pending?.since ?? now;
     const wait = Math.max(0, Math.min(this.debounceMs, since + this.maxWaitMs - now));
-    this.pending.set(activityId, { since, view, timer: setTimeout(() => void this.write(activityId, view), wait) });
+    const latest = changes.at(-1)?.entry;
+    this.pending.set(activityId, { since, view, timer: setTimeout(() => void this.write(activityId, view, latest?.version, latest?.receivedAt), wait) });
   };
 
   /**
@@ -85,18 +86,23 @@ export class SummaryWriter {
   /** Brings the list in line with the archive: drops activities that have aged out, adds any missing. */
   async prune(): Promise<void> {
     const now = this.now();
-    for (const [id, summary] of this.summaries) await this.put(ACTIVITY_LIST_ID, id, inActivityList(summary.activity, now) ? summary : null);
+    for (const [id, summary] of this.summaries) await this.put(ACTIVITY_LIST_ID, id, inActivityList(summary.activity, now) ? this.liveSummary(summary) : null);
   }
 
   /** Writes the summary where it changed; true if it wrote any. */
-  private async write(activityId: string, view: ReadView): Promise<boolean> {
+  private async write(activityId: string, view: ReadView, activityVersion?: number, changedAt?: number): Promise<boolean> {
     this.pending.delete(activityId);
     const summary = activitySummary(view, activityId);
+    if (summary && activityVersion !== undefined) Object.assign(summary, { activityVersion, changedAt });
     if (summary) this.summaries.set(activityId, summary);
     else this.summaries.delete(activityId);
     const archived = await this.put(ACTIVITY_ARCHIVE_ID, activityId, summary);
-    const listed = await this.put(ACTIVITY_LIST_ID, activityId, summary && inActivityList(summary.activity, this.now()) ? summary : null);
+    const listed = await this.put(ACTIVITY_LIST_ID, activityId, summary && inActivityList(summary.activity, this.now()) ? this.liveSummary(summary) : null);
     return archived || listed;
+  }
+
+  private liveSummary({ activityVersion: _version, changedAt: _changedAt, ...summary }: ActivitySummary): ActivitySummary {
+    return summary;
   }
 
   /** Writes one scope's summary (null removes it) if it isn't what that scope has; true if it did. */

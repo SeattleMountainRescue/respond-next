@@ -6,6 +6,24 @@ import { StorageConflictError, type CommitBatch, type ActivityStorage, type LogE
 const types = new pg.TypeOverrides();
 types.setTypeParser(pg.types.builtins.INT8, Number);
 
+export const INTEGRATION_WEBHOOK_SCHEMA = `
+CREATE TABLE IF NOT EXISTS integration_webhooks (
+  key_id text PRIMARY KEY,
+  target_id text NOT NULL,
+  signing_secret text NOT NULL
+);
+CREATE TABLE IF NOT EXISTS integration_webhook_jobs (
+  key_id text NOT NULL REFERENCES integration_webhooks(key_id) ON DELETE CASCADE,
+  activity_id text NOT NULL,
+  version bigint NOT NULL,
+  changed_at bigint NOT NULL,
+  attempts integer NOT NULL DEFAULT 0,
+  ready_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (key_id, activity_id, version)
+);
+CREATE INDEX IF NOT EXISTS integration_webhook_jobs_ready ON integration_webhook_jobs (ready_at);
+`;
+
 /**
  * Tables. Records are stored whole as jsonb: this layer stays domain-agnostic, and reporting can
  * query the jsonb or get typed views later. `mutation_log.seq` gives the log a strict order;
@@ -44,6 +62,7 @@ CREATE TABLE IF NOT EXISTS mutation_log (
   UNIQUE (activity_id, client_id, mutation_id)
 );
 CREATE INDEX IF NOT EXISTS mutation_log_activity_seq ON mutation_log (activity_id, seq);
+${INTEGRATION_WEBHOOK_SCHEMA}
 `;
 
 /** Any fixed number: serializes schema setup when several processes start at once. */
@@ -144,6 +163,14 @@ export class PostgresStorage implements ActivityStorage {
                   e->>'outcome', to_timestamp((e->>'receivedAt')::double precision / 1000), e
            FROM jsonb_array_elements($1::jsonb) WITH ORDINALITY AS t(e, n) ORDER BY n`,
           [JSON.stringify(batch.log)],
+        );
+      }
+      const latest = batch.log.at(-1);
+      if (latest && batch.version > batch.fromVersion && !activityId.startsWith('$')) {
+        await db.query(
+          `INSERT INTO integration_webhook_jobs (key_id, activity_id, version, changed_at)
+           SELECT key_id, $1, $2, $3 FROM integration_webhooks FOR KEY SHARE`,
+          [activityId, batch.version, latest.receivedAt],
         );
       }
     });

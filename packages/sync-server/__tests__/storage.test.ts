@@ -115,6 +115,9 @@ describe.each(backends)('%s storage', (_name, makeBackend) => {
       prepare: () => ({ name: 'addPerson', args: { id: 'new', name: 'New' } }),
     };
     expect(await hub.submitIntegration('e1', request)).toEqual({ version: 2 });
+    const actor = await hub.actor('e1');
+    actor.stale = true;
+    expect(await actor.submitIntegration(request)).toEqual({ version: 2 });
     const restarted = makeHub();
     expect(await restarted.submitIntegration('e1', request)).toEqual({ version: 2 });
     expect(await restarted.submitIntegration('e1', { ...request, fingerprint: 'different' })).toMatchObject({ reason: 'idempotency_conflict' });

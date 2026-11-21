@@ -57,6 +57,7 @@ export type Location = z.infer<typeof Location>;
 export const ACTIVITY_RECORD_ID = 'activity';
 
 export interface ActivityRec extends Rec {
+  externalRef?: string;
   type: 'activity';
   idNumber: string;
   kind: ActivityKind;

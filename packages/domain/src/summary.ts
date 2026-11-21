@@ -44,6 +44,9 @@ export interface ActivityResponse {
 
 /** What a summary says; stored as an ActivitySummaryRec in the list scope. */
 export interface ActivitySummary {
+  externalRef?: string;
+  activityVersion?: number;
+  changedAt?: number;
   type: 'activitySummary';
   /** The activity's id. */
   id: string;
@@ -80,6 +83,7 @@ export function activitySummary(view: ReadView, activityId: string): ActivitySum
     .sort((x, y) => (x.rosterName ?? x.title).localeCompare(y.rosterName ?? y.title));
   return {
     type: 'activitySummary',
+    ...(a.externalRef === undefined ? {} : { externalRef: a.externalRef }),
     id: activityId,
     ownerOrgId: a.ownerOrgId,
     activity: {

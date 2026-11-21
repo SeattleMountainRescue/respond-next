@@ -34,7 +34,7 @@ export interface People {
 }
 
 /** Their tier from their groups (`fromGroups`, else looked up), and their grants. */
-async function access(people: People, personRef: string, fromGroups?: Tier): Promise<Pick<SessionData, 'tier' | 'grants'>> {
+export async function access(people: People, personRef: string, fromGroups?: Tier): Promise<Pick<SessionData, 'tier' | 'grants'>> {
   const tier = fromGroups ?? (await people.members?.lookup(personRef))?.tier ?? 'respond';
   return { tier, grants: (await people.grants?.forPerson(personRef)) ?? {} };
 }

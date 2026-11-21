@@ -20,12 +20,14 @@ export class ActivityLogWriter {
   readonly onCommit = (activityId: string, view: ReadView, changes: CommittedChange[]): void => {
     if (isReservedScope(activityId)) return;
     const lines: (LogLine & { id: string })[] = [];
+    const offsets = new Map<number, number>();
     for (const { entry, viewer } of changes) {
       const v = viewer as ActivityViewer;
+      const offset = offsets.get(entry.version) ?? 0;
       // Ids from the activity's version (padded, so they sort), so writing again leaves the line alone.
-      narrate({ name: entry.name, args: entry.args, at: entry.at, receivedAt: entry.receivedAt, effects: entry.effects, actor: { userId: v.userId, name: v.name, personRef: v.personRef } }, view).forEach((line, i) =>
-        lines.push({ id: `${String(entry.version).padStart(9, '0')}.${i}`, ...line }),
-      );
+      const narrated = narrate({ name: entry.name, args: entry.args, at: entry.at, receivedAt: entry.receivedAt, effects: entry.effects, actor: { userId: v.userId, name: v.name, personRef: v.personRef } }, view);
+      narrated.forEach((line, i) => lines.push({ id: `${String(entry.version).padStart(9, '0')}.${offset + i}`, ...line }));
+      offsets.set(entry.version, offset + narrated.length);
     }
     const activity = getActivity(view);
     const copy = activity && activity.version !== this.copied.get(activityId) ? activity : undefined;

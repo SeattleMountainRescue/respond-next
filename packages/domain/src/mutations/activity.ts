@@ -6,6 +6,7 @@ import { asActivityViewer, canManage, canManageMissions } from '../viewer';
 import { addStatus, at, id, idSource, requireActivity, requireOpen } from './common';
 
 const ActivityFields = z.object({
+  externalRef: z.string().trim().min(1).max(200).optional(),
   idNumber: z.string().trim(),
   kind: z.enum(ACTIVITY_KINDS),
   title: z.string().trim().min(1),
