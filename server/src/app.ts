@@ -1,17 +1,14 @@
 import { Hono, type Context } from 'hono';
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import { createNodeWebSocket } from '@hono/node-ws';
-import { HIDDEN_VIEW, PROTOCOL, type Rec, type Viewer } from '@sync/core';
+import { HIDDEN_VIEW, PROTOCOL, type Rec } from '@sync/core';
 import {
   ACTIVITY_ARCHIVE_ID,
   MEMBER_QUERY_MAX,
-  activityOfScope,
   MEMBER_QUERY_MIN,
   SavedLocation,
   isValidPoint,
-  viewerOfSession,
   type ActivitiesResponse,
-  type ActivityViewer,
   type ActivityResponse,
   type AdminMemberProvidersResponse,
   type AdminOrganizationsResponse,
@@ -29,12 +26,12 @@ import type { LocationCatalog } from './locations';
 import type { MemberProviders } from './memberProviders';
 import type { GoogleSignIn, SignInStart } from './google';
 import { hasMaskable, iconSizeOf, iconSourceFor, IconRenderer } from './icons';
-import { integrationRoutes, newIntegrationCredential, NewIntegrationKey, type integrationKeys } from './integration';
+import { integrationRoutes, newIntegrationCredential, NewIntegrationKey } from './integration';
 import { bodyLimit } from 'hono/body-limit';
 import type { webhookTargets } from './integrationWebhooks';
 import { hostnameOf, type OrganizationStore } from './organizations';
 import { SESSION_COOKIE, SESSION_TTL_SECONDS, type SessionData, type SessionStore } from './sessions';
-import { devSignIn, memberSignIn, refreshSession, tierOn, type People } from './signIn';
+import { devSignIn, memberSignIn, refreshSession, tierOn, viewerOf, viewerOn, type People } from './signIn';
 import type { WeatherSource } from './weather';
 
 export interface SyncAppOptions {
@@ -64,23 +61,12 @@ export interface SyncAppOptions {
   locations?: LocationCatalog;
   /** The ops dashboard's forecasts. */
   weather?: WeatherSource;
-  integrationKeys?: ReturnType<typeof integrationKeys>;
   webhookTargets?: ReturnType<typeof webhookTargets>;
   /** Dev-only JSON view of an activity's server state. Leave unset in production. */
   debugActivity?(activityId: string, view: string): Promise<unknown>;
 }
 
 type Env = { Variables: { site: Organization; session: SessionData } };
-
-/** Who someone is, on the site they signed in on: which decides the activities they see. */
-const viewerOf = (session: SessionData): ActivityViewer => ({ ...viewerOfSession(session), siteId: session.orgId });
-
-/** Who someone is on one activity: as signed in, unless they have a grant there. */
-function viewerOn(session: SessionData, activityId: string): Viewer {
-  const viewer = viewerOf(session);
-  const tier = tierOn(session, activityOfScope(activityId));
-  return tier === viewer.tier ? viewer : { ...viewer, tier };
-}
 
 export function createSyncApp(hub: Hub, options: SyncAppOptions) {
   const { organizations: orgs, sessions } = options;
@@ -104,7 +90,6 @@ export function createSyncApp(hub: Hub, options: SyncAppOptions) {
     if (!/^[a-z0-9.-]+(:\d+)?$/i.test(site) || !orgs.forHost(site)) return failed(c, "That sign-in started on a site that isn't here.");
     return c.redirect(`${scheme}://${site}/api/auth/callback?${new URL(c.req.url).searchParams}`);
   });
-
   // Everything else under /api is for one site, by hostname.
   app.use('/api/*', async (c, next) => {
     const site = orgs.forHost(c.req.header('host'));
@@ -113,7 +98,6 @@ export function createSyncApp(hub: Hub, options: SyncAppOptions) {
     await next();
   });
 
-  app.route('/api/integration/v1', integrationRoutes(hub, options.integrationKeys ?? new Map(), orgs, options.members, options.grants));
 
   /**
    * The signed-in session, if it was started on this site. With the dev sign-in it may also come from
@@ -125,6 +109,7 @@ export function createSyncApp(hub: Hub, options: SyncAppOptions) {
     return data?.orgId === c.get('site').id ? data : undefined;
   };
   const people: People = { members: options.members, grants: options.grants };
+  app.route('/api/integration/v1', integrationRoutes(hub, orgs, people));
   const toSession = ({ orgId: _, grants: _grants, ...data }: SessionData): Session => ({ ...data, admin: orgs.isAdmin(data.email) });
   /** Routes below it need a session. */
   const signedIn = async (c: Context<Env>, next: () => Promise<void>) => {
@@ -397,23 +382,47 @@ export function createSyncApp(hub: Hub, options: SyncAppOptions) {
   app.get(integrationAdminPath, signedIn, keyAdmin, async (c) => {
     return c.json({ keys: await orgs.listIntegrationKeys(c.req.param('id')!) });
   });
-  app.post(integrationAdminPath, signedIn, keyAdmin, bodyLimit({ maxSize: 2048 }), async (c) => {
+  const personalKeys = '/api/integration-keys';
+  app.use(personalKeys, async (c, next) => {
+    c.header('Cache-Control', 'no-store');
+    if (!orgs.managesIntegrationKeys) return c.json({ error: 'not_found' }, 404);
+    await next();
+  });
+  app.get(personalKeys, signedIn, async (c) => {
+    const { orgId, personRef } = c.get('session');
+    return c.json({ keys: await orgs.listIntegrationKeys(orgId, personRef) });
+  });
+  app.delete(`${personalKeys}/:keyId`, signedIn, async (c) => {
+    c.header('Cache-Control', 'no-store');
+    if (!orgs.managesIntegrationKeys) return c.json({ error: 'not_found' }, 404);
+    const { orgId, personRef } = c.get('session');
+    if (!(await orgs.revokeIntegrationKey(c.req.param('keyId')!, orgId, personRef))) return c.json({ error: 'No active key' }, 404);
+    return c.json({ status: 'ok' });
+  });
+  app.post(personalKeys, signedIn, bodyLimit({ maxSize: 2048 }), async (c) => {
+    const session = c.get('session');
+    if (session.class !== 'member' || session.personRef.startsWith('adhoc:')) return c.json({ error: 'not_eligible' }, 403);
     if (c.req.header('content-type')?.split(';', 1)[0]?.trim().toLowerCase() !== 'application/json') return c.json({ error: 'Expected JSON' }, 415);
     const input = NewIntegrationKey.safeParse(await c.req.json().catch((err: unknown) => {
       if (!(err instanceof SyntaxError)) throw err;
       return undefined;
     }));
-    if (!input.success) return c.json({ error: 'Provide a key name and a directory person reference' }, 400);
-    const organizationId = c.req.param('id');
-    if (!(await options.members?.accessInOrganization(organizationId, input.data.personRef))) {
-      return c.json({ error: 'That member is not in this organization’s directory' }, 400);
+    if (!input.success) return c.json({ error: 'Provide a key name and scope' }, 400);
+    const { orgId: organizationId, personRef } = session;
+    let found;
+    try {
+      found = await options.members?.lookup(personRef);
+    } catch {
+      console.error('integration: member lookup unavailable during key issuance');
+      return c.json({ error: 'directory_unavailable' }, 503);
     }
-    const { name, personRef, webhookTarget } = input.data;
+    if (!found) return c.json({ error: 'Member is not in the directory' }, 400);
+    const { name, scope, webhookTarget } = input.data;
     if (webhookTarget && (!orgs.canSignIntegrationWebhooks || options.webhookTargets?.get(webhookTarget)?.organizationId !== organizationId)) {
       return c.json({ error: 'That webhook target is not available for this organization' }, 400);
     }
     const { id, token, sha256, signingSecret } = newIntegrationCredential();
-    await orgs.createIntegrationKey({ id, sha256, organizationId, name, personRef, createdBy: c.get('session').userId },
+    await orgs.createIntegrationKey({ id, sha256, organizationId, name, personRef, scope, createdBy: session.userId },
       webhookTarget ? { targetId: webhookTarget, secret: signingSecret } : undefined);
     return c.json({ id, token, ...(webhookTarget ? { signingSecret } : {}) }, 201);
   });

@@ -37,6 +37,9 @@ describe('dev sign-in', () => {
     expect(within(screen.getByRole('menu')).getByText('Pat Visitor')).toBeTruthy();
     // Not an admin: no admin page.
     expect(within(screen.getByRole('menu')).queryByText('Organizations')).toBeNull();
+    fireEvent.click(within(screen.getByRole('menu')).getByText('API keys'));
+    expect(await screen.findByText('Only signed-in directory members can issue API keys.')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Issue key' })).toBeNull();
   });
 });
 

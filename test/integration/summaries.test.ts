@@ -58,6 +58,24 @@ describe('activity summaries on the server', () => {
     s.stop();
   });
 
+  it('does not write to the archive when only a participant ETA changes', async () => {
+    const s = await setup();
+    const participantId = participantIdFor('kcsara:1');
+    const eta = T0 + 3 * HOUR;
+    s.manage.mutate('a1', 'createActivity', activityArgs());
+    s.manage.mutate('a1', 'addParticipant', { personRef: 'kcsara:1', firstname: 'Anna', lastname: 'Lee', unit: CRT, status: 'staging', at: T0 + HOUR });
+    await vi.advanceTimersByTimeAsync(3000);
+    const { version } = await s.hub.read(ACTIVITY_ARCHIVE_ID, SYSTEM_VIEWER);
+    expect(version).toBeGreaterThan(0);
+
+    s.manage.mutate('a1', 'setEta', { participantId, eta });
+    await vi.advanceTimersByTimeAsync(3000);
+    const { records } = await s.hub.read('a1', SYSTEM_VIEWER);
+    expect(records.find((r) => r.type === 'participant' && r.id === participantId)).toMatchObject({ eta });
+    expect((await s.hub.read(ACTIVITY_ARCHIVE_ID, SYSTEM_VIEWER)).version).toBe(version);
+    s.stop();
+  });
+
   it('drops a removed activity from the list', async () => {
     const s = await setup();
     s.manage.mutate('a1', 'createActivity', activityArgs());

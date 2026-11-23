@@ -14,7 +14,6 @@ import { MemoryGrantStore, PostgresGrantStore, type GrantStore } from './grants'
 import { MemberInfoWriter } from './memberInfo';
 import { MemberProviders } from './memberProviders';
 import { SignInProviders } from './google';
-import { integrationKeys } from './integration';
 import { deliverIntegrationWebhooks, webhookTargets } from './integrationWebhooks';
 import { OrganizationStore } from './organizations';
 import { SecretBox } from './secrets';
@@ -31,9 +30,7 @@ const production = process.env.NODE_ENV === 'production';
 // local build that reaches the internet doesn't take them along.
 const devTools = process.env.DEV_TOOLS === 'true';
 if (devTools) console.warn('DEV_TOOLS is on: anyone can sign in as anyone. Never on an internet-facing site.');
-const keys = integrationKeys(process.env.INTEGRATION_API_KEYS);
 const hooks = webhookTargets(process.env.INTEGRATION_WEBHOOK_TARGETS);
-if (keys.size && !process.env.DATABASE_URL) throw new Error('The integration API requires DATABASE_URL for durable storage');
 
 // SITE_ADMINS: comma-separated emails, site admins beside those the admin page keeps.
 const envAdmins = (process.env.SITE_ADMINS ?? '').split(',');
@@ -113,7 +110,7 @@ const hub: Hub = new Hub({
   projector: siteActivityProjector(organizations.seesActivity),
   now: Date.now,
   onCommit: (activityId, view, changes) => {
-    summaries.onCommit(activityId, view, changes);
+    summaries.onCommit(activityId, view);
     memberInfo.onCommit(activityId, view);
     activityLog.onCommit(activityId, view, changes);
   },
@@ -125,12 +122,12 @@ const hub: Hub = new Hub({
 const backfilled = await summaries.backfill(storage);
 if (backfilled) console.log(`added summaries for ${backfilled} activities`);
 
-if (hooks.size && organizations.canSignIntegrationWebhooks) {
+if (organizations.canSignIntegrationWebhooks) {
   let running = false;
   setInterval(() => {
     if (running) return;
     running = true;
-    void deliverIntegrationWebhooks(organizations, members, hub, hooks)
+    void deliverIntegrationWebhooks(organizations, members, hub, hooks, undefined, grants)
       .catch((err) => console.error('integration webhook worker failed', err))
       .finally(() => { running = false; });
   }, 5000).unref();
@@ -144,7 +141,6 @@ setInterval(() => void summaries.prune().catch((err) => console.error('sync: pru
 const { app, injectWebSocket } = createSyncApp(hub, {
   organizations,
   sessions,
-  integrationKeys: keys,
   webhookTargets: hooks,
   devSignIn: devTools,
   // Each site signs in through its organization's sign-in provider (or its nearest ancestor's).

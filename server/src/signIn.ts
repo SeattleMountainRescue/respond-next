@@ -5,7 +5,7 @@
  * When their grants change, their sessions are worked out again (`refreshSession`).
  */
 import { z } from 'zod';
-import { TIERS, currentTier, highestTier, type Organization, type Tier } from '@sync/domain';
+import { TIERS, activityOfScope, currentTier, highestTier, viewerOfSession, type ActivityViewer, type Organization, type Tier } from '@sync/domain';
 import type { GrantStore } from './grants';
 import type { MemberDetails } from './members';
 import type { SessionData } from './sessions';
@@ -82,7 +82,15 @@ export function tierOn(session: Pick<SessionData, 'tier' | 'grants'>, activityId
 }
 
 /** The session with its tier and grants worked out again, as now. */
-export async function refreshSession(people: People, session: SessionData): Promise<SessionData> {
-  const fromGroups = session.personRef.startsWith('adhoc:') ? 'respond' : undefined;
+export async function refreshSession(people: People, session: SessionData, tier?: Tier): Promise<SessionData> {
+  const fromGroups = session.personRef.startsWith('adhoc:') ? 'respond' : tier;
   return { ...session, ...(await access(people, session.personRef, fromGroups)) };
+}
+
+export const viewerOf = (session: SessionData): ActivityViewer => ({ ...viewerOfSession(session), siteId: session.orgId });
+
+export function viewerOn(session: SessionData, activityId: string): ActivityViewer {
+  const viewer = viewerOf(session);
+  const tier = tierOn(session, activityOfScope(activityId));
+  return tier === viewer.tier ? viewer : { ...viewer, tier };
 }

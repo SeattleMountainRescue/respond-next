@@ -44,6 +44,16 @@ export function AppMenu() {
           >
             Preferences
           </MenuItem>
+          {session && (
+            <MenuItem
+              onClick={() => {
+                handleClose();
+                navigate('~/api-keys');
+              }}
+            >
+              API keys
+            </MenuItem>
+          )}
           {session?.admin && (
             <MenuItem
               onClick={() => {

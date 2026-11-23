@@ -44,6 +44,9 @@ export interface Api {
   removeLocation(id: string): Promise<void>;
   /** NOAA's current forecast for a point; throws with the reason when there isn't one. */
   weather(lat: number, lon: number): Promise<WeatherReport>;
+  integrationKeys(): Promise<IntegrationKeyView[]>;
+  issueIntegrationKey(input: NewIntegrationKey): Promise<IssuedIntegrationKey>;
+  revokeIntegrationKey(keyId: string): Promise<void>;
   admin: AdminApi;
 }
 
@@ -52,8 +55,7 @@ export interface AdminApi {
   organizations(): Promise<AdminOrganizationsResponse>;
   saveOrganization(org: Organization): Promise<Organization>;
   removeOrganization(id: string): Promise<void>;
-  integrationKeys(id: string): Promise<IntegrationKeyView[]>;
-  issueIntegrationKey(id: string, input: { name: string; personRef: string; webhookTarget?: string }): Promise<{ token: string; signingSecret?: string }>;
+  integrationKeys(id: string): Promise<AdminIntegrationKeyView[]>;
   revokeIntegrationKey(id: string, keyId: string): Promise<void>;
   siteAdmins(): Promise<SiteAdminsResponse>;
   setSiteAdmins(stored: string[]): Promise<SiteAdminsResponse>;
@@ -65,12 +67,32 @@ export interface AdminApi {
   removeSignInProvider(id: string): Promise<void>;
 }
 
+export type IntegrationKeyScope = 'read' | 'write';
+
+export interface NewIntegrationKey {
+  name: string;
+  scope: IntegrationKeyScope;
+  webhookTarget?: string;
+}
+
+export interface IssuedIntegrationKey {
+  id: string;
+  token: string;
+  signingSecret?: string;
+}
+
 export interface IntegrationKeyView {
   id: string;
   name: string;
-  personRef: string;
+  scope: IntegrationKeyScope;
+  createdAt: string;
   lastUsedAt: string | null;
   revokedAt: string | null;
+  webhookTarget: string | null;
+}
+
+export interface AdminIntegrationKeyView extends Pick<IntegrationKeyView, 'id' | 'name' | 'scope' | 'lastUsedAt' | 'revokedAt'> {
+  personRef: string;
 }
 
 async function call<T>(what: string, url: string, init?: RequestInit): Promise<T> {
@@ -85,7 +107,8 @@ async function call<T>(what: string, url: string, init?: RequestInit): Promise<T
 const json = (method: string, body: unknown): RequestInit => ({ method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
 
 const grantPath = (activityId: string, personRef: string) => `/api/activities/${encodeURIComponent(activityId)}/grants/${encodeURIComponent(personRef)}`;
-const integrationKeyPath = (orgId: string) => `/api/admin/organizations/${encodeURIComponent(orgId)}/integration-keys`;
+const integrationKeyPath = '/api/integration-keys';
+const adminIntegrationKeyPath = (orgId: string) => `/api/admin/organizations/${encodeURIComponent(orgId)}/integration-keys`;
 
 export const fetchApi: Api = {
   async session() {
@@ -133,6 +156,13 @@ export const fetchApi: Api = {
   weather(lat, lon) {
     return call<WeatherReport>('weather', `/api/weather?lat=${lat}&lon=${lon}`);
   },
+  async integrationKeys() {
+    return (await call<{ keys: IntegrationKeyView[] }>('API keys', integrationKeyPath)).keys;
+  },
+  issueIntegrationKey: (input) => call('issue API key', integrationKeyPath, json('POST', input)),
+  async revokeIntegrationKey(keyId) {
+    await call('revoke API key', `${integrationKeyPath}/${encodeURIComponent(keyId)}`, { method: 'DELETE' });
+  },
   admin: {
     organizations: () => call<AdminOrganizationsResponse>('organizations', '/api/admin/organizations'),
     async saveOrganization(org) {
@@ -142,11 +172,10 @@ export const fetchApi: Api = {
       await call('remove organization', `/api/admin/organizations/${encodeURIComponent(id)}`, { method: 'DELETE' });
     },
     async integrationKeys(id) {
-      return (await call<{ keys: IntegrationKeyView[] }>('integration keys', integrationKeyPath(id))).keys;
+      return (await call<{ keys: AdminIntegrationKeyView[] }>('integration keys', adminIntegrationKeyPath(id))).keys;
     },
-    issueIntegrationKey: (id, input) => call('issue integration key', integrationKeyPath(id), json('POST', input)),
     async revokeIntegrationKey(id, keyId) {
-      await call('revoke integration key', `${integrationKeyPath(id)}/${encodeURIComponent(keyId)}`, { method: 'DELETE' });
+      await call('revoke integration key', `${adminIntegrationKeyPath(id)}/${encodeURIComponent(keyId)}`, { method: 'DELETE' });
     },
     siteAdmins: () => call<SiteAdminsResponse>('site admins', '/api/admin/site-admins'),
     setSiteAdmins: (stored) => call<SiteAdminsResponse>('save site admins', '/api/admin/site-admins', json('PUT', { stored })),

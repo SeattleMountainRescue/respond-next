@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS integration_keys (
   organization_id text NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
   sha256 text NOT NULL,
   person_ref text NOT NULL,
+  scope text NOT NULL CHECK (scope IN ('read', 'write')),
   name text NOT NULL,
   created_by text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
@@ -163,18 +164,20 @@ export class OrganizationStore {
   }
 
   async integrationKey(id: string, organizationId: string) {
-    const result = await this.pool?.query<{ id: string; sha256: string; personRef: string; organizationId: string }>(
-      `SELECT id, sha256, person_ref AS "personRef", organization_id AS "organizationId"
+    const result = await this.pool?.query<{ id: string; sha256: string; personRef: string; organizationId: string; scope: 'read' | 'write' }>(
+      `SELECT id, sha256, person_ref AS "personRef", organization_id AS "organizationId", scope
        FROM integration_keys WHERE id = $1 AND organization_id = $2 AND revoked_at IS NULL`, [id, organizationId],
     );
     return result?.rows[0];
   }
 
-  async listIntegrationKeys(organizationId: string) {
+  async listIntegrationKeys(organizationId: string, personRef?: string) {
     const result = await this.pool?.query(
-      `SELECT id, name, person_ref AS "personRef", created_by AS "createdBy", created_at AS "createdAt",
-              last_used_at AS "lastUsedAt", revoked_at AS "revokedAt"
-       FROM integration_keys WHERE organization_id = $1 ORDER BY created_at DESC`, [organizationId],
+      `SELECT k.id, k.name, k.person_ref AS "personRef", k.scope, k.created_at AS "createdAt",
+              k.last_used_at AS "lastUsedAt", k.revoked_at AS "revokedAt", h.target_id AS "webhookTarget"
+       FROM integration_keys k LEFT JOIN integration_webhooks h ON h.key_id = k.id
+       WHERE k.organization_id = $1 AND ($2::text IS NULL OR k.person_ref = $2)
+       ORDER BY k.created_at DESC`, [organizationId, personRef ?? null],
     );
     return result?.rows;
   }
@@ -183,13 +186,13 @@ export class OrganizationStore {
     return this.managesIntegrationKeys && this.secrets.ready;
   }
 
-  async createIntegrationKey(key: { id: string; organizationId: string; sha256: string; personRef: string; name: string; createdBy: string },
+  async createIntegrationKey(key: { id: string; organizationId: string; sha256: string; personRef: string; name: string; createdBy: string; scope: 'read' | 'write' },
     webhook?: { targetId: string; secret: string }) {
     if (!this.pool) throw new Error('Integration key management requires PostgreSQL');
     await this.transaction(async (db) => {
       await db.query(
-        'INSERT INTO integration_keys (id, organization_id, sha256, person_ref, name, created_by) VALUES ($1, $2, $3, $4, $5, $6)',
-        [key.id, key.organizationId, key.sha256, key.personRef, key.name, key.createdBy],
+        'INSERT INTO integration_keys (id, organization_id, sha256, person_ref, name, created_by, scope) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+        [key.id, key.organizationId, key.sha256, key.personRef, key.name, key.createdBy, key.scope],
       );
       if (webhook) await db.query(
         'INSERT INTO integration_webhooks (key_id, target_id, signing_secret) VALUES ($1, $2, $3)',
@@ -206,13 +209,13 @@ export class OrganizationStore {
     );
   }
 
-  async revokeIntegrationKey(id: string, organizationId: string) {
+  async revokeIntegrationKey(id: string, organizationId: string, personRef?: string) {
     if (!this.pool) return false;
     let revoked = false;
     await this.transaction(async (db) => {
       const result = await db.query(
-        'UPDATE integration_keys SET revoked_at = now() WHERE id = $1 AND organization_id = $2 AND revoked_at IS NULL',
-        [id, organizationId],
+        'UPDATE integration_keys SET revoked_at = now() WHERE id = $1 AND organization_id = $2 AND revoked_at IS NULL AND ($3::text IS NULL OR person_ref = $3)',
+        [id, organizationId, personRef ?? null],
       );
       if (result.rowCount !== 1) return;
       await db.query('DELETE FROM integration_webhooks WHERE key_id = $1', [id]);
@@ -229,13 +232,13 @@ export class OrganizationStore {
     if (!this.pool) throw new Error('Integration webhooks require PostgreSQL');
     const { rows } = await this.pool.query<WebhookJob>(`
       WITH ready AS (
-        SELECT j.key_id, j.activity_id, j.version FROM integration_webhook_jobs j
+        SELECT j.key_id, j.activity_id FROM integration_webhook_jobs j
         WHERE j.ready_at <= now()
         ORDER BY j.ready_at LIMIT 16 FOR UPDATE SKIP LOCKED
       )
       UPDATE integration_webhook_jobs j SET attempts = j.attempts + 1, ready_at = now() + interval '1 minute'
       FROM ready r, integration_webhooks h, integration_keys k
-      WHERE (j.key_id, j.activity_id, j.version) = (r.key_id, r.activity_id, r.version)
+      WHERE (j.key_id, j.activity_id) = (r.key_id, r.activity_id)
         AND j.ready_at <= now() AND h.key_id = j.key_id AND k.id = j.key_id AND k.revoked_at IS NULL
       RETURNING j.key_id AS "keyId", j.activity_id AS "activityId", j.version, j.changed_at AS "changedAt", j.attempts,
                 h.target_id AS "targetId", h.signing_secret AS "signingSecret", k.organization_id AS "organizationId", k.person_ref AS "personRef"
@@ -244,18 +247,25 @@ export class OrganizationStore {
   }
 
   async finishWebhookJob(job: WebhookJob) {
-    await this.pool?.query(
+    const result = await this.pool?.query(
       'DELETE FROM integration_webhook_jobs WHERE key_id = $1 AND activity_id = $2 AND version = $3 AND attempts = $4',
       [job.keyId, job.activityId, job.version, job.attempts],
     );
+    if (result?.rowCount === 0) {
+      await this.pool?.query(
+        `UPDATE integration_webhook_jobs SET attempts = 0, ready_at = now()
+         WHERE key_id = $1 AND activity_id = $2 AND version > $3 AND attempts = $4`,
+        [job.keyId, job.activityId, job.version, job.attempts],
+      );
+    }
   }
 
   async retryWebhookJob(job: WebhookJob) {
     const delay = Math.min(3600, 2 ** Math.min(job.attempts, 12));
     await this.pool?.query(
-      `UPDATE integration_webhook_jobs SET ready_at = now() + ($5 * interval '1 second')
-       WHERE key_id = $1 AND activity_id = $2 AND version = $3 AND attempts = $4`,
-      [job.keyId, job.activityId, job.version, job.attempts, delay],
+      `UPDATE integration_webhook_jobs SET ready_at = now() + ($4 * interval '1 second')
+       WHERE key_id = $1 AND activity_id = $2 AND attempts = $3`,
+      [job.keyId, job.activityId, job.attempts, delay],
     );
   }
 

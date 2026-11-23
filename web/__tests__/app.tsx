@@ -134,6 +134,9 @@ function apiFor(locations: MemoryLocationCatalog, orgs: OrganizationStore, hub: 
   saveLocation: (location) => locations.put(location),
   removeLocation: (id) => locations.remove(id),
     weather: async () => WEATHER,
+    integrationKeys: async () => [],
+    issueIntegrationKey: async () => { throw new Error('Integration keys require PostgreSQL'); },
+    revokeIntegrationKey: async () => { throw new Error('Integration keys require PostgreSQL'); },
     admin: {
       organizations: async () => {
         const email = data?.email;
@@ -142,7 +145,6 @@ function apiFor(locations: MemoryLocationCatalog, orgs: OrganizationStore, hub: 
       saveOrganization: async (org) => done(await orgs.save(org, data?.email)),
       removeOrganization: async (id) => void done(await orgs.remove(id, data?.email)),
       integrationKeys: async () => [],
-      issueIntegrationKey: async () => { throw new Error('Integration keys require PostgreSQL'); },
       revokeIntegrationKey: async () => { throw new Error('Integration keys require PostgreSQL'); },
       siteAdmins: async () => orgs.siteAdmins(),
       setSiteAdmins: async (stored) => (await orgs.setSiteAdmins(stored), orgs.siteAdmins()),
@@ -202,10 +204,10 @@ export async function serverWithActivity(options: { siteAdmins?: string[]; devSi
   // People signing in on CRT's site respond under CRT.
   const site = (): BootstrapResponse => ({ config: organizations.siteConfig(organizations.get(CRT.id)!, { devSignIn: options.devSignIn ?? true, googleSignIn: options.googleSignIn, buildId: 'test' }) });
   let nextClient = 1;
-  const renderApp = (path = '/') => {
+  const renderApp = (path = '/', overrideApi?: (api: Api) => Api) => {
     window.history.replaceState(null, '', path);
     const index = nextClient++;
-    return render(<App bootstrap={async () => site()} api={api} sync={{ transport: transport(index), persistence: () => new MemoryPersistence() }} />);
+    return render(<App bootstrap={async () => site()} api={overrideApi?.(api) ?? api} sync={{ transport: transport(index), persistence: () => new MemoryPersistence() }} />);
   };
   return { net, seed, locations, organizations, grants, grantManage, renderApp, stop: () => seed.stop() };
 }

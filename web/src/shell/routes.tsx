@@ -1,6 +1,7 @@
 import { lazy, Suspense } from 'react';
 import { Route, Switch } from 'wouter';
 import { RespondRoutes, Home } from '../sections/respond';
+import { ApiKeys } from './ApiKeys';
 import { ToolbarPage } from './ToolbarPage';
 
 // Respond is what most people open, so it loads with the shell, as in the legacy app; the rest load
@@ -22,6 +23,7 @@ export function AppRoutes() {
   return (
     <Switch>
       <Route path="/" component={Home} />
+      <Route path="/api-keys" component={ApiKeys} />
       <Route path="/mission" nest>
         <RespondRoutes type="missions" />
       </Route>

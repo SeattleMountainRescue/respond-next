@@ -45,8 +45,6 @@ export interface ActivityResponse {
 /** What a summary says; stored as an ActivitySummaryRec in the list scope. */
 export interface ActivitySummary {
   externalRef?: string;
-  activityVersion?: number;
-  changedAt?: number;
   type: 'activitySummary';
   /** The activity's id. */
   id: string;

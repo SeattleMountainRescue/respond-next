@@ -6,7 +6,11 @@ import { StorageConflictError, type CommitBatch, type ActivityStorage, type LogE
 const types = new pg.TypeOverrides();
 types.setTypeParser(pg.types.builtins.INT8, Number);
 
+/** Any fixed number: serializes schema setup when several processes start at once. */
+const SCHEMA_LOCK = 0x5359_4e43;
+
 export const INTEGRATION_WEBHOOK_SCHEMA = `
+SELECT pg_advisory_xact_lock(${SCHEMA_LOCK});
 CREATE TABLE IF NOT EXISTS integration_webhooks (
   key_id text PRIMARY KEY,
   target_id text NOT NULL,
@@ -19,8 +23,35 @@ CREATE TABLE IF NOT EXISTS integration_webhook_jobs (
   changed_at bigint NOT NULL,
   attempts integer NOT NULL DEFAULT 0,
   ready_at timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (key_id, activity_id, version)
+  PRIMARY KEY (key_id, activity_id)
 );
+-- Collapse an existing per-version outbox without clearing its leases or backoff.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'integration_webhook_jobs'::regclass AND contype = 'p' AND cardinality(conkey) = 3
+  ) THEN
+    LOCK TABLE integration_webhook_jobs IN ACCESS EXCLUSIVE MODE;
+    WITH latest AS (
+      SELECT key_id, activity_id, max(version) AS version, max(changed_at) AS changed_at,
+             max(attempts) AS attempts, max(ready_at) AS ready_at
+      FROM integration_webhook_jobs GROUP BY key_id, activity_id HAVING count(*) > 1
+    )
+    UPDATE integration_webhook_jobs j
+    SET changed_at = l.changed_at, attempts = l.attempts, ready_at = l.ready_at
+    FROM latest l
+    WHERE (j.key_id, j.activity_id, j.version) = (l.key_id, l.activity_id, l.version);
+    DELETE FROM integration_webhook_jobs j USING (
+      SELECT key_id, activity_id, max(version) AS version
+      FROM integration_webhook_jobs GROUP BY key_id, activity_id HAVING count(*) > 1
+    ) latest
+    WHERE (j.key_id, j.activity_id) = (latest.key_id, latest.activity_id) AND j.version < latest.version;
+    ALTER TABLE integration_webhook_jobs
+      DROP CONSTRAINT integration_webhook_jobs_pkey,
+      ADD PRIMARY KEY (key_id, activity_id);
+  END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS integration_webhook_jobs_ready ON integration_webhook_jobs (ready_at);
 `;
 
@@ -64,9 +95,6 @@ CREATE TABLE IF NOT EXISTS mutation_log (
 CREATE INDEX IF NOT EXISTS mutation_log_activity_seq ON mutation_log (activity_id, seq);
 ${INTEGRATION_WEBHOOK_SCHEMA}
 `;
-
-/** Any fixed number: serializes schema setup when several processes start at once. */
-const SCHEMA_LOCK = 0x5359_4e43;
 
 /**
  * PostgreSQL storage. Each commit is one transaction; the version guard is a conditional update
@@ -168,8 +196,11 @@ export class PostgresStorage implements ActivityStorage {
       const latest = batch.log.at(-1);
       if (latest && batch.version > batch.fromVersion && !activityId.startsWith('$')) {
         await db.query(
-          `INSERT INTO integration_webhook_jobs (key_id, activity_id, version, changed_at)
-           SELECT key_id, $1, $2, $3 FROM integration_webhooks FOR KEY SHARE`,
+          `INSERT INTO integration_webhook_jobs AS jobs (key_id, activity_id, version, changed_at)
+           SELECT key_id, $1, $2, $3 FROM integration_webhooks FOR KEY SHARE
+           ON CONFLICT (key_id, activity_id) DO UPDATE
+             SET version = greatest(jobs.version, excluded.version),
+                 changed_at = greatest(jobs.changed_at, excluded.changed_at)`,
           [activityId, batch.version, latest.receivedAt],
         );
       }
